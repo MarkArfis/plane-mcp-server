@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Literal, get_args
 
 from fastmcp import FastMCP
+from plane.errors.errors import PlaneError
 from plane.models.work_item_relation_definitions import (
     CreateWorkItemRelationDefinition,
     PaginatedWorkItemRelationDefinitionResponse,
@@ -19,7 +20,9 @@ from plane.models.work_item_relation_definitions import (
 from plane.models.work_items import (
     CreateWorkItemCustomRelation,
     CreateWorkItemDependency,
+    CreateWorkItemRelation,
     DependencyTypeEnum,
+    RemoveWorkItemRelation,
 )
 
 from plane_mcp.client import get_plane_client_context
@@ -102,6 +105,35 @@ def _all_definitions(client, workspace_slug: str, is_default, is_active) -> list
             return results
 
 
+def _is_not_found(error: PlaneError) -> bool:
+    return getattr(error, "status_code", None) == 404
+
+
+def _legacy_list(client, workspace_slug: str, project_id: str, workitem_id: str) -> dict[str, Any]:
+    """Dependencies via the pre-1.5 route work-items/{id}/relations/ (Plane Community <= 1.4.2)."""
+    # Raw JSON on purpose: the SDK's response model demands every direction and would reject a shorter reply.
+    raw = client.work_items.relations._get(f"{workspace_slug}/projects/{project_id}/work-items/{workitem_id}/relations")
+    return {"dependencies": raw, "custom": {}}
+
+
+def _legacy_create(client, workspace_slug: str, project_id: str, workitem_id: str, relation_type: str, targets):
+    return client.work_items.relations.create(
+        workspace_slug=workspace_slug,
+        project_id=project_id,
+        work_item_id=workitem_id,
+        data=CreateWorkItemRelation(relation_type=relation_type, issues=targets),  # type: ignore[arg-type]
+    )
+
+
+def _legacy_remove(client, workspace_slug: str, project_id: str, workitem_id: str, related_workitem_id: str):
+    return client.work_items.relations.delete(
+        workspace_slug=workspace_slug,
+        project_id=project_id,
+        work_item_id=workitem_id,
+        data=RemoveWorkItemRelation(related_issue=related_workitem_id),
+    )
+
+
 def register(mcp: FastMCP) -> None:
     @mcp.tool(
         name=NAME,
@@ -140,12 +172,16 @@ def register(mcp: FastMCP) -> None:
         client, workspace_slug = get_plane_client_context()
 
         if action == "list_definitions":
-            return {
-                "built_in_dependencies": list(DEPENDENCY_TYPES),
-                "custom_definitions": [
+            try:
+                custom_definitions = [
                     d.model_dump() for d in _all_definitions(client, workspace_slug, is_default, is_active)
-                ],
-            }
+                ]
+            except PlaneError as error:
+                if not _is_not_found(error):
+                    raise
+                # Older Plane has no relation definitions: only the built-in dependencies exist.
+                custom_definitions = []
+            return {"built_in_dependencies": list(DEPENDENCY_TYPES), "custom_definitions": custom_definitions}
 
         if action == "create_definition":
             if not name:
@@ -183,12 +219,17 @@ def register(mcp: FastMCP) -> None:
             return error
 
         if action == "list":
-            dependencies = client.work_items.dependencies.list(
-                workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
-            )
-            custom = client.work_items.custom_relations.list(
-                workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
-            )
+            try:
+                dependencies = client.work_items.dependencies.list(
+                    workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
+                )
+                custom = client.work_items.custom_relations.list(
+                    workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
+                )
+            except PlaneError as error:
+                if not _is_not_found(error):
+                    raise
+                return _legacy_list(client, workspace_slug, project_id, workitem_id)
             return {
                 "dependencies": dependencies.model_dump(),
                 "custom": {label: [item.model_dump() for item in items] for label, items in custom.items()},
@@ -201,15 +242,20 @@ def register(mcp: FastMCP) -> None:
             if relation_type:
                 if error := one_of("relation_type", relation_type, DEPENDENCY_TYPES, _OTHER_RELATIONS):
                     return error
-                return client.work_items.dependencies.create(
-                    workspace_slug=workspace_slug,
-                    project_id=project_id,
-                    work_item_id=workitem_id,
-                    data=CreateWorkItemDependency(
-                        relation_type=relation_type,  # type: ignore[arg-type]
-                        work_item_ids=targets,
-                    ),
-                )
+                try:
+                    return client.work_items.dependencies.create(
+                        workspace_slug=workspace_slug,
+                        project_id=project_id,
+                        work_item_id=workitem_id,
+                        data=CreateWorkItemDependency(
+                            relation_type=relation_type,  # type: ignore[arg-type]
+                            work_item_ids=targets,
+                        ),
+                    )
+                except PlaneError as error:
+                    if not _is_not_found(error):
+                        raise
+                    return _legacy_create(client, workspace_slug, project_id, workitem_id, relation_type, targets)
             if relation_definition_id and relation_definition_label:
                 return client.work_items.custom_relations.create(
                     workspace_slug=workspace_slug,
@@ -230,10 +276,15 @@ def register(mcp: FastMCP) -> None:
         if not related_workitem_id:
             return missing(action, "related_workitem_id")
         remove = client.work_items.dependencies.remove if is_dependency else client.work_items.custom_relations.remove
-        remove(
-            workspace_slug=workspace_slug,
-            project_id=project_id,
-            work_item_id=workitem_id,
-            related_work_item_id=related_workitem_id,
-        )
+        try:
+            remove(
+                workspace_slug=workspace_slug,
+                project_id=project_id,
+                work_item_id=workitem_id,
+                related_work_item_id=related_workitem_id,
+            )
+        except PlaneError as error:
+            if not _is_not_found(error):
+                raise
+            _legacy_remove(client, workspace_slug, project_id, workitem_id, related_workitem_id)
         return None
