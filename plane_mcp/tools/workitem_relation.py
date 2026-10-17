@@ -41,6 +41,8 @@ NAME = "workitem_relation"
 TITLE = "Work item relations"
 
 DEPENDENCY_TYPES: tuple[str, ...] = get_args(DependencyTypeEnum)
+# Built-in types of the pre-1.5 /relations/ route only; newer Plane models them as custom relations.
+LEGACY_ONLY_TYPES: tuple[str, ...] = ("relates_to", "duplicate")
 
 _OTHER_RELATIONS = (
     "For any other relationship pass relation_definition_id and "
@@ -73,7 +75,9 @@ FOOTER = (
     "Call list_definitions first and match the user's wording to an entry. A "
     f"built_in_dependencies value ({', '.join(DEPENDENCY_TYPES)}) goes in relation_type; a "
     "custom definition needs its id in relation_definition_id and the matched outward or "
-    "inward label in relation_definition_label, which sets direction."
+    "inward label in relation_definition_label, which sets direction. "
+    f"On Plane Community <= 1.4.2 relation_type also takes {' and '.join(LEGACY_ONLY_TYPES)}, "
+    "and delete is not available: the API has no route for it, relations are removed in the web UI."
 )
 
 LEGACY = {
@@ -117,21 +121,44 @@ def _legacy_list(client, workspace_slug: str, project_id: str, workitem_id: str)
 
 
 def _legacy_create(client, workspace_slug: str, project_id: str, workitem_id: str, relation_type: str, targets):
-    return client.work_items.relations.create(
+    created = client.work_items.relations.create(
         workspace_slug=workspace_slug,
         project_id=project_id,
         work_item_id=workitem_id,
         data=CreateWorkItemRelation(relation_type=relation_type, issues=targets),  # type: ignore[arg-type]
     )
+    # Plane drops ids it cannot find in the workspace without an error, so read back what really exists.
+    present = _legacy_list(client, workspace_slug, project_id, workitem_id)["dependencies"].get(relation_type) or []
+    present_ids = {entry.get("issue_id") if isinstance(entry, dict) else entry for entry in present}
+    not_created = [target for target in targets if target not in present_ids]
+    if not not_created:
+        return created
+    return {
+        "created": created,
+        "not_created": not_created,
+        "note": "Plane silently skipped these work item ids; they do not exist in this workspace.",
+    }
+
+
+_LEGACY_DELETE_UNAVAILABLE = (
+    "Error: this Plane instance cannot remove relations through its API (Plane Community <= 1.4.2 has no "
+    "route for it). Nothing was changed; the relation has to be removed in the Plane web UI."
+)
 
 
 def _legacy_remove(client, workspace_slug: str, project_id: str, workitem_id: str, related_workitem_id: str):
-    return client.work_items.relations.delete(
-        workspace_slug=workspace_slug,
-        project_id=project_id,
-        work_item_id=workitem_id,
-        data=RemoveWorkItemRelation(related_issue=related_workitem_id),
-    )
+    try:
+        client.work_items.relations.delete(
+            workspace_slug=workspace_slug,
+            project_id=project_id,
+            work_item_id=workitem_id,
+            data=RemoveWorkItemRelation(related_issue=related_workitem_id),
+        )
+    except PlaneError as error:
+        if not _is_not_found(error):
+            raise
+        return _LEGACY_DELETE_UNAVAILABLE
+    return None
 
 
 def register(mcp: FastMCP) -> None:
@@ -239,8 +266,20 @@ def register(mcp: FastMCP) -> None:
             targets = coerce_list(workitem_ids)
             if not targets:
                 return missing(action, "workitem_ids")
+            if relation_type in LEGACY_ONLY_TYPES:
+                try:
+                    return _legacy_create(client, workspace_slug, project_id, workitem_id, relation_type, targets)
+                except PlaneError as error:
+                    if not _is_not_found(error):
+                        raise
+                    return (
+                        f"Error: relation_type '{relation_type}' only exists on Plane Community <= 1.4.2. "
+                        f"{_OTHER_RELATIONS}"
+                    )
             if relation_type:
-                if error := one_of("relation_type", relation_type, DEPENDENCY_TYPES, _OTHER_RELATIONS):
+                if error := one_of(
+                    "relation_type", relation_type, DEPENDENCY_TYPES + LEGACY_ONLY_TYPES, _OTHER_RELATIONS
+                ):
                     return error
                 try:
                     return client.work_items.dependencies.create(
@@ -286,5 +325,5 @@ def register(mcp: FastMCP) -> None:
         except PlaneError as error:
             if not _is_not_found(error):
                 raise
-            _legacy_remove(client, workspace_slug, project_id, workitem_id, related_workitem_id)
+            return _legacy_remove(client, workspace_slug, project_id, workitem_id, related_workitem_id)
         return None
