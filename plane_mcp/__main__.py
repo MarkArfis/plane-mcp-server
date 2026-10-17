@@ -114,6 +114,10 @@ class ServerMode(Enum):
     STDIO = "stdio"
     SSE = "sse"
     HTTP = "http"
+    # Header (API key) auth only: no OAuth provider, so no PLANE_OAUTH_PROVIDER_* configuration is needed.
+    # For self-hosting behind a gateway such as MetaMCP that sends the PAT (Authorization: Bearer)
+    # and X-Workspace-slug with every request.
+    HTTP_HEADER = "http-header"
 
 
 @asynccontextmanager
@@ -124,6 +128,43 @@ async def combined_lifespan(oauth_app, header_app, sse_app):
         async with header_app.lifespan(header_app):
             async with sse_app.lifespan(sse_app):
                 yield
+
+
+def build_header_only_app(prefix: str = "") -> Starlette:
+    """The /http/api-key endpoint of the http mode on its own."""
+    header_app = get_header_mcp().http_app(stateless_http=True)
+    return Starlette(
+        routes=[Mount(prefix + "/http/api-key", app=header_app)],
+        lifespan=header_app.lifespan,
+    )
+
+
+def _serve(app: Starlette) -> None:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Configure uvicorn loggers to use JSON formatting too
+    for uv_logger_name in ("uvicorn", "uvicorn.error"):
+        uv_logger = logging.getLogger(uv_logger_name)
+        for h in uv_logger.handlers[:]:
+            uv_logger.removeHandler(h)
+        uv_handler = logging.StreamHandler(sys.stderr)
+        uv_handler.setFormatter(JSONFormatter())
+        uv_handler.addFilter(UserContextFilter())
+        uv_logger.addHandler(uv_handler)
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8211,
+        log_level="info",
+        access_log=False,
+    )
 
 
 def main() -> None:
@@ -171,32 +212,14 @@ def main() -> None:
             lifespan=lambda app: combined_lifespan(oauth_app, header_app, sse_app),
         )
 
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=False,
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
-
-        # Configure uvicorn loggers to use JSON formatting too
-        for uv_logger_name in ("uvicorn", "uvicorn.error"):
-            uv_logger = logging.getLogger(uv_logger_name)
-            for h in uv_logger.handlers[:]:
-                uv_logger.removeHandler(h)
-            uv_handler = logging.StreamHandler(sys.stderr)
-            uv_handler.setFormatter(JSONFormatter())
-            uv_handler.addFilter(UserContextFilter())
-            uv_logger.addHandler(uv_handler)
-
         logger.info("Starting HTTP server at URLs: /mcp and /header/mcp")
-        uvicorn.run(
-            app,
-            host="0.0.0.0",
-            port=8211,
-            log_level="info",
-            access_log=False,
-        )
+        _serve(app)
+        return
+
+    if server_mode == ServerMode.HTTP_HEADER:
+        prefix = os.getenv("MCP_PATH_PREFIX") or ""
+        logger.info(f"Starting header-auth HTTP server at {prefix}/http/api-key/mcp")
+        _serve(build_header_only_app(prefix))
         return
 
 

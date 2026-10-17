@@ -1,0 +1,19 @@
+# Coolify: new resource -> Docker Compose, repo MarkArfis/plane-mcp-server, branch legacy-relations,
+# compose path /deploy/docker-compose.yml. No public domain needed: MetaMCP reaches the service
+# on the shared Docker network (see README.md in this folder).
+services:
+  plane-mcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      # MetaMCP sends the Plane PAT (Authorization: Bearer) and X-Workspace-slug per request.
+      PLANE_BASE_URL: ${PLANE_BASE_URL:?set PLANE_BASE_URL, e.g. https://plane.example.org}
+      LOG_PAYLOADS: "false"
+    expose:
+      - "8211"
+    # Hard ceiling so a misbehaving process can never take the whole VPS down again.
+    cpus: "0.5"
+    mem_limit: 384m
+    pids_limit: 128
